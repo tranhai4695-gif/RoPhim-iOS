@@ -14,13 +14,8 @@ struct WebView: UIViewRepresentable {
         if #available(iOS 15.4, *) {
             config.preferences.isElementFullscreenEnabled = true
         }
-        config.preferences.javaScriptCanOpenWindowsAutomatically = false
-
-        // Ẩn các khung quảng cáo hay gặp + chặn window.open (popup)
-        let script = WKUserScript(source: Self.cleanupJS,
-                                  injectionTime: .atDocumentStart,
-                                  forMainFrameOnly: false)
-        config.userContentController.addUserScript(script)
+        // Cho phép window.open để web thấy popup "đã mở" (popup sẽ bị giấu và tự đóng)
+        config.preferences.javaScriptCanOpenWindowsAutomatically = true
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -31,22 +26,20 @@ struct WebView: UIViewRepresentable {
         webView.scrollView.backgroundColor = .black
         webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
-        // Kéo xuống để tải lại
         let refresh = UIRefreshControl()
         refresh.addTarget(context.coordinator, action: #selector(Coordinator.reload(_:)), for: .valueChanged)
         webView.scrollView.refreshControl = refresh
         context.coordinator.webView = webView
 
-        // Nạp bộ lọc chặn quảng cáo rồi mới mở trang
-        WKContentRuleListStore.default().compileContentRuleList(
-            forIdentifier: "AdBlock",
-            encodedContentRuleList: Self.ruleListJSON
-        ) { list, error in
-            if let list = list {
-                webView.configuration.userContentController.add(list)
-            } else if let error = error {
-                print("AdBlock compile error: \(error)")
+        if AppConfig.strictAdBlock {
+            WKContentRuleListStore.default().compileContentRuleList(
+                forIdentifier: "AdBlock",
+                encodedContentRuleList: Self.ruleListJSON
+            ) { list, _ in
+                if let list = list { webView.configuration.userContentController.add(list) }
+                webView.load(URLRequest(url: url))
             }
+        } else {
             webView.load(URLRequest(url: url))
         }
         return webView
@@ -58,6 +51,7 @@ struct WebView: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         weak var webView: WKWebView?
+        private var hiddenPopups: [WKWebView] = []
 
         @objc func reload(_ sender: UIRefreshControl) {
             webView?.reload()
@@ -69,32 +63,64 @@ struct WebView: UIViewRepresentable {
             return AppConfig.allowedHostKeywords.contains { host.contains($0) }
         }
 
+        private func isPopup(_ webView: WKWebView) -> Bool {
+            hiddenPopups.contains { $0 === webView }
+        }
+
         func webView(_ webView: WKWebView,
                      decidePolicyFor action: WKNavigationAction,
                      decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             let url = action.request.url
             let scheme = url?.scheme?.lowercased() ?? ""
 
-            // Chặn mở app khác / App Store / link lạ
+            // Không bao giờ cho mở app khác / App Store
             if !["http", "https", "about", "blob", "data", "javascript"].contains(scheme) {
                 decisionHandler(.cancel); return
             }
-            // Chỉ kiểm soát khung chính; iframe (player video) được phép tải
+            // Popup ngầm: cho tải (để web ghi nhận), người dùng không thấy
+            if isPopup(webView) { decisionHandler(.allow); return }
+
+            // Trang chính: chặn chuyển hướng sang trang quảng cáo
             if action.targetFrame?.isMainFrame ?? true, !isAllowed(url) {
                 decisionHandler(.cancel); return
             }
             decisionHandler(.allow)
         }
 
-        // Popup (target=_blank / window.open): nếu là link trong web thì mở tại chỗ, còn lại bỏ qua
         func webView(_ webView: WKWebView,
                      createWebViewWith configuration: WKWebViewConfiguration,
                      for action: WKNavigationAction,
                      windowFeatures: WKWindowFeatures) -> WKWebView? {
-            if isAllowed(action.request.url), action.request.url != nil {
+            // Link nội bộ mở bằng target=_blank: mở luôn trong app
+            if let url = action.request.url, isAllowed(url), url.host != nil {
                 webView.load(action.request)
+                return nil
             }
-            return nil
+            // Popup quảng cáo: tạo cửa sổ ẩn, không âm thanh, tự đóng sau 8 giây
+            configuration.mediaTypesRequiringUserActionForPlayback = .all
+            configuration.allowsInlineMediaPlayback = false
+            let popup = WKWebView(frame: CGRect(x: -2000, y: -2000, width: 10, height: 10),
+                                  configuration: configuration)
+            popup.isHidden = true
+            popup.isUserInteractionEnabled = false
+            popup.navigationDelegate = self
+            popup.uiDelegate = self
+            webView.addSubview(popup)
+            hiddenPopups.append(popup)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self, weak popup] in
+                guard let popup = popup else { return }
+                popup.stopLoading()
+                popup.removeFromSuperview()
+                self?.hiddenPopups.removeAll { $0 === popup }
+            }
+            return popup
+        }
+
+        func webViewDidClose(_ webView: WKWebView) {
+            if isPopup(webView) {
+                webView.removeFromSuperview()
+                hiddenPopups.removeAll { $0 === webView }
+            }
         }
 
         // Không hiện hộp thoại alert/confirm từ quảng cáo
@@ -104,46 +130,19 @@ struct WebView: UIViewRepresentable {
         }
         func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
                      initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
-            completionHandler(false)
+            completionHandler(isPopup(webView) ? false : true)
         }
     }
 
-    // MARK: - Bộ lọc
+    // MARK: - Bộ lọc (chỉ dùng khi strictAdBlock = true)
 
     static var ruleListJSON: String {
-        var rules: [[String: Any]] = AppConfig.blockedDomains.map { domain in
+        let rules: [[String: Any]] = AppConfig.blockedDomains.map { domain in
             let escaped = NSRegularExpression.escapedPattern(for: domain)
             return ["trigger": ["url-filter": ".*\(escaped).*"],
                     "action": ["type": "block"]]
         }
-        // Ẩn phần tử quảng cáo phổ biến
-        rules.append([
-            "trigger": ["url-filter": ".*"],
-            "action": ["type": "css-display-none",
-                       "selector": "[id*='banner-ads'], [class*='banner-ads'], [id^='ads-'], [class^='ads-'], .ads, .ad-banner, .adsbygoogle, [id*='catfish'], [class*='catfish'], [id*='popup-ads'], [class*='popup-ads'], [class*='preload-ads'], [id*='preload-ads'], ins.adsbygoogle"]
-        ])
         let data = try! JSONSerialization.data(withJSONObject: rules)
         return String(data: data, encoding: .utf8)!
     }
-
-    static let cleanupJS = """
-    (function() {
-      try { window.open = function() { return null; }; } catch (e) {}
-      function isFixedOverlay(el) {
-        var s = getComputedStyle(el);
-        if (s.position !== 'fixed') return false;
-        if (el.querySelector('video, iframe[src*="player"], iframe[src*="embed"]')) return false;
-        var z = parseInt(s.zIndex || '0', 10);
-        var hasAdLink = el.querySelector('a[href^="http"]:not([href*="rophim"])');
-        return z > 999 && !!hasAdLink;
-      }
-      function clean() {
-        document.querySelectorAll('body > div, body > a, body > iframe').forEach(function(el) {
-          try { if (isFixedOverlay(el)) el.remove(); } catch (e) {}
-        });
-      }
-      document.addEventListener('DOMContentLoaded', clean);
-      setInterval(clean, 1500);
-    })();
-    """
 }

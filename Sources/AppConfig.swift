@@ -8,6 +8,11 @@ enum AppConfig {
     /// Mọi chuyển hướng khác (thường là quảng cáo) sẽ bị chặn.
     static let allowedHostKeywords = ["rophim"]
 
+    /// false (mặc định): chế độ nhẹ. Không chặn mạng quảng cáo để web không báo "Phát hiện AdBlock",
+    ///   nhưng popup quảng cáo được mở ngầm rồi tự đóng, và chặn chuyển hướng sang trang lạ.
+    /// true: chặn mạnh theo danh sách blockedDomains (web có thể phát hiện và khóa).
+    static let strictAdBlock = false
+
     /// Các tên miền quảng cáo/theo dõi phổ biến bị chặn hoàn toàn.
     static let blockedDomains = [
         "doubleclick.net", "googlesyndication.com", "googleadservices.com",
