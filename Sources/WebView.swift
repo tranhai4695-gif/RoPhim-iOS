@@ -17,6 +17,10 @@ struct WebView: UIViewRepresentable {
         // Cho phép window.open để web thấy popup "đã mở" (popup sẽ bị giấu và tự đóng)
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
 
+        // Chống trang phát hiện "AdBlock"
+        config.userContentController.addUserScript(
+            WKUserScript(source: AntiDetect.js, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
